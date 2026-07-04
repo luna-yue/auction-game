@@ -3,41 +3,80 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"strconv"
+	"sync"
+
+	"github.com/gorilla/websocket"
 )
 
-var currentPrice int
-var eventChan = make(chan int, 10)
+type BidEvent struct {
+	Price int
+}
 
-func run(){
-	for price:=range eventChan{
-		if price > currentPrice{
-			currentPrice = price
-			fmt.Println("Current Price Updated:", currentPrice)
+var (
+	currentPrice int
+
+	eventChan = make(chan BidEvent, 100)
+
+	clients   = make(map[*websocket.Conn]bool)
+	clientsMu sync.Mutex
+
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
+)
+
+func broadcast(price int) {
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+
+	for conn := range clients {
+		_ = conn.WriteJSON(map[string]int{
+			"price": price,
+		})
+	}
+}
+
+func run() {
+	for event := range eventChan {
+
+		if event.Price > currentPrice {
+			currentPrice = event.Price
+			fmt.Println("New Price:", currentPrice)
+
+			broadcast(currentPrice)
 		}
 	}
 }
 
-func bid(w http.ResponseWriter, r *http.Request){
-	price := r.URL.Query().Get("price")
-	if price == ""{
-		http.Error(w, "Price is required", http.StatusBadRequest)
-		return
-	}
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, _ := upgrader.Upgrade(w, r, nil)
 
-	var bidPrice int
-	_, err := fmt.Sscanf(price, "%d", &bidPrice)
-	if err != nil {
-		http.Error(w, "Invalid price format", http.StatusBadRequest)
-		return
-	}
+	clientsMu.Lock()
+	clients[conn] = true
+	clientsMu.Unlock()
 
-	eventChan <- bidPrice
-	fmt.Fprintf(w, "Bid received: %d", bidPrice)
+	for {
+		var msg map[string]string
+
+		err := conn.ReadJSON(&msg)
+		if err != nil {
+			break
+		}
+
+		price, _ := strconv.Atoi(msg["price"])
+
+		eventChan <- BidEvent{
+			Price: price,
+		}
+	}
 }
 
 
 func main(){
 	go run()
-	http.HandleFunc("/bid", bid)
+	http.HandleFunc("/ws", wsHandler)
 	http.ListenAndServe(":8080", nil)
 }
